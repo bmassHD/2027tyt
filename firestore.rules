@@ -1,0 +1,815 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        (
+          'email' in request.auth.token &&
+          request.auth.token.email is string &&
+          'email_verified' in request.auth.token &&
+          request.auth.token.email_verified == true &&
+          request.auth.token.email.lower() in ['sonlyhongduc@gmail.com', 'sonlyhongduc2003@gmail.com', 'tytvtd@gmail.com']
+        ) ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        (
+          exists(/databases/$(database)/documents/users/$(request.auth.uid)) && (
+            ('role' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data &&
+              get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ['admin', 'super_admin']) ||
+            ('accountType' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data &&
+              get(/databases/$(database)/documents/users/$(request.auth.uid)).data.accountType == 'admin')
+          )
+        )
+      );
+    }
+
+    function isStaff() {
+      return isSignedIn() && (
+        isAdmin() ||
+        (
+          exists(/databases/$(database)/documents/users/$(request.auth.uid)) && (
+            ('accountType' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data &&
+              get(/databases/$(database)/documents/users/$(request.auth.uid)).data.accountType in ['employee', 'admin']) ||
+            ('role' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data &&
+              get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ['doctor', 'nurse', 'communicator', 'staff', 'leadership', 'admin', 'super_admin'])
+          )
+        )
+      );
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isNotBanned() {
+      return !isSignedIn() || isAdmin() || !(
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('status', 'active') == 'banned' &&
+        (
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('banType', 'permanent') != 'temporary' ||
+          !(
+            'bannedUntilMs' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data &&
+            get(/databases/$(database)/documents/users/$(request.auth.uid)).data.bannedUntilMs is number &&
+            request.time.toMillis() >= get(/databases/$(database)/documents/users/$(request.auth.uid)).data.bannedUntilMs
+          )
+        )
+      );
+    }
+
+    // Admins collection
+    match /admins/{adminId} {
+      allow get: if isValidId(adminId) && isAdmin();
+      allow list: if isAdmin();
+      allow create, update, delete: if isValidId(adminId) && isAdmin();
+    }
+
+    function isValidUserTotp(data) {
+      return data.keys().hasAll(['enabled', 'secret', 'updatedAt']) &&
+        data.keys().hasOnly(['enabled', 'secret', 'recoveryCodes', 'issuer', 'verifiedAt', 'updatedAt']) &&
+        data.enabled is bool &&
+        data.secret is string && data.secret.size() >= 16 && data.secret.size() <= 128 &&
+        data.updatedAt is string && data.updatedAt.size() >= 1 && data.updatedAt.size() <= 64 &&
+        (!('issuer' in data) || (data.issuer is string && data.issuer.size() <= 128)) &&
+        (!('verifiedAt' in data) || (data.verifiedAt is string && data.verifiedAt.size() <= 64)) &&
+        (!('recoveryCodes' in data) || (
+          data.recoveryCodes is list &&
+          data.recoveryCodes.size() <= 12 &&
+          (data.recoveryCodes.size() == 0 || (data.recoveryCodes[0] is string && data.recoveryCodes[0].size() <= 32))
+        ));
+    }
+
+    function isValidUserDevice(data, deviceId) {
+      return data.keys().hasAll(['deviceId', 'deviceName', 'platform', 'isTrusted', 'verifiedAt', 'lastActiveAt']) &&
+        data.keys().hasOnly(['deviceId', 'deviceName', 'platform', 'os', 'browser', 'isTrusted', 'verificationMethod', 'verifiedAt', 'firstSeenAt', 'lastActiveAt']) &&
+        data.deviceId is string && data.deviceId == deviceId && data.deviceId.size() <= 128 &&
+        data.deviceName is string && data.deviceName.size() >= 1 && data.deviceName.size() <= 128 &&
+        data.platform in ['mobile', 'tablet', 'desktop'] &&
+        data.isTrusted is bool &&
+        data.verifiedAt is string && data.verifiedAt.size() >= 1 && data.verifiedAt.size() <= 64 &&
+        data.lastActiveAt is string && data.lastActiveAt.size() >= 1 && data.lastActiveAt.size() <= 64 &&
+        (!('os' in data) || (data.os is string && data.os.size() <= 64)) &&
+        (!('browser' in data) || (data.browser is string && data.browser.size() <= 64)) &&
+        (!('verificationMethod' in data) || data.verificationMethod in ['password', 'google', 'sms_mfa', 'sms_otp', 'totp_2fa', 'manual']) &&
+        (!('firstSeenAt' in data) || (data.firstSeenAt is string && data.firstSeenAt.size() <= 64));
+    }
+
+    function isValidVerifiedIdentifier(data, identifierId) {
+      return data.keys().hasAll(['id', 'type', 'ownerUid', 'locked', 'verifiedAt']) &&
+        data.keys().hasOnly(['id', 'type', 'valueMasked', 'ownerUid', 'locked', 'verifiedAt']) &&
+        data.id is string && data.id == identifierId && data.id.size() >= 3 && data.id.size() <= 128 &&
+        data.type in ['email', 'phone', 'cccd'] &&
+        data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 &&
+        (data.ownerUid == request.auth.uid || isAdmin()) &&
+        data.locked == true &&
+        data.verifiedAt is string && data.verifiedAt.size() >= 1 && data.verifiedAt.size() <= 64 &&
+        (!('valueMasked' in data) || (data.valueMasked is string && data.valueMasked.size() <= 128));
+    }
+
+    // Verified Identifiers Exclusive Lock Registry (owner can release only when Admin unlocks identity edit)
+    match /verifiedIdentifiers/{identifierId} {
+      allow get: if isValidId(identifierId);
+      allow list: if isAdmin();
+      allow create: if isValidId(identifierId) && isSignedIn() && isNotBanned() && isValidVerifiedIdentifier(request.resource.data, identifierId);
+      allow update: if false;
+      allow delete: if isValidId(identifierId) && (
+        isAdmin() ||
+        (
+          isSignedIn() &&
+          isNotBanned() &&
+          resource.data.ownerUid == request.auth.uid &&
+          exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('allowIdentityEditByAdmin', false) == true
+        )
+      );
+    }
+
+    function isValidReferralCode(data, codeId) {
+      return data.keys().hasAll(['code', 'active', 'targetAccountType', 'targetRole', 'createdByUid', 'createdAt', 'usedCount']) &&
+        data.keys().hasOnly([
+          'code', 'label', 'active', 'targetAccountType', 'targetRole',
+          'createdByUid', 'createdByEmail', 'createdAt', 'usedCount',
+          'lastUsedAt', 'lastUsedByUid'
+        ]) &&
+        data.code is string && data.code == codeId && data.code.size() >= 4 && data.code.size() <= 64 &&
+        data.active is bool &&
+        data.targetAccountType == 'employee' &&
+        data.targetRole in ['staff', 'doctor', 'nurse', 'communicator', 'leadership'] &&
+        data.createdByUid is string && data.createdByUid.size() >= 1 && data.createdByUid.size() <= 128 &&
+        data.createdAt is string && data.createdAt.size() >= 1 && data.createdAt.size() <= 64 &&
+        data.usedCount is int && data.usedCount >= 0 &&
+        (!('label' in data) || (data.label is string && data.label.size() <= 128)) &&
+        (!('createdByEmail' in data) || (data.createdByEmail is string && data.createdByEmail.size() <= 256)) &&
+        (!('lastUsedAt' in data) || (data.lastUsedAt is string && data.lastUsedAt.size() <= 64)) &&
+        (!('lastUsedByUid' in data) || (data.lastUsedByUid is string && data.lastUsedByUid.size() <= 128));
+    }
+
+    // Referral Codes for automatic Cán bộ Y tế registration (only Admins list/manage, public get by exact code)
+    match /referralCodes/{codeId} {
+      allow get: if isValidId(codeId);
+      allow list: if isAdmin();
+      allow create, delete: if isValidId(codeId) && isAdmin() &&
+        (request.method == 'delete' || isValidReferralCode(request.resource.data, codeId));
+      allow update: if isValidId(codeId) &&
+        isValidReferralCode(request.resource.data, codeId) &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        request.resource.data.createdByUid == resource.data.createdByUid && (
+          isAdmin() || (
+            isSignedIn() &&
+            resource.data.active == true &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['usedCount', 'lastUsedAt', 'lastUsedByUid']) &&
+            request.resource.data.usedCount is int &&
+            request.resource.data.usedCount == resource.data.get('usedCount', 0) + 1 &&
+            request.resource.data.lastUsedByUid == request.auth.uid
+          )
+        );
+    }
+
+    // Users collection
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isStaff());
+      allow list: if isAdmin();
+      allow create: if isValidId(userId) && (
+        isAdmin() ||
+        (
+          isOwner(userId) &&
+          request.resource.data.uid == userId &&
+          !('banType' in request.resource.data) &&
+          !('bannedUntil' in request.resource.data) &&
+          !('bannedUntilMs' in request.resource.data) &&
+          !('banReason' in request.resource.data) &&
+          !('bannedAt' in request.resource.data) &&
+          !('bannedByUid' in request.resource.data) &&
+          !('bannedByName' in request.resource.data) &&
+          (
+            (
+              request.resource.data.role == 'citizen' &&
+              request.resource.data.accountType == 'citizen' &&
+              request.resource.data.status == 'active'
+            ) ||
+            (
+              'referralCodeUsed' in request.resource.data &&
+              isValidId(request.resource.data.referralCodeUsed) &&
+              exists(/databases/$(database)/documents/referralCodes/$(request.resource.data.referralCodeUsed)) &&
+              get(/databases/$(database)/documents/referralCodes/$(request.resource.data.referralCodeUsed)).data.active == true &&
+              request.resource.data.role == get(/databases/$(database)/documents/referralCodes/$(request.resource.data.referralCodeUsed)).data.targetRole &&
+              request.resource.data.accountType == 'employee' &&
+              request.resource.data.status == 'active'
+            )
+          )
+        )
+      );
+      allow update: if isValidId(userId) && (
+        isAdmin() ||
+        (isOwner(userId) && isNotBanned() && request.resource.data.uid == userId &&
+          request.resource.data.role == resource.data.role &&
+          request.resource.data.accountType == resource.data.accountType &&
+          request.resource.data.get('status', 'active') == resource.data.get('status', 'active') &&
+          request.resource.data.get('banType', '') == resource.data.get('banType', '') &&
+          request.resource.data.get('bannedUntil', '') == resource.data.get('bannedUntil', '') &&
+          request.resource.data.get('bannedUntilMs', 0) == resource.data.get('bannedUntilMs', 0) &&
+          request.resource.data.get('banReason', '') == resource.data.get('banReason', '') &&
+          request.resource.data.get('bannedAt', '') == resource.data.get('bannedAt', '') &&
+          request.resource.data.get('bannedByUid', '') == resource.data.get('bannedByUid', '') &&
+          request.resource.data.get('bannedByName', '') == resource.data.get('bannedByName', '') &&
+          request.resource.data.get('allowIdentityEditByAdmin', false) == resource.data.get('allowIdentityEditByAdmin', false) &&
+          (
+            resource.data.get('emailVerified', false) != true ||
+            (
+              request.resource.data.get('emailVerified', false) == true &&
+              request.resource.data.get('email', '') == resource.data.get('email', '')
+            )
+          ) &&
+          (
+            resource.data.get('allowIdentityEditByAdmin', false) == true ||
+            (
+              (
+                resource.data.get('phoneVerified', false) != true ||
+                (
+                  request.resource.data.get('phoneVerified', false) == true &&
+                  request.resource.data.get('verifiedPhone', '') == resource.data.get('verifiedPhone', '') &&
+                  request.resource.data.get('phoneNumber', '') == resource.data.get('phoneNumber', '')
+                )
+              ) &&
+              (
+                (
+                  resource.data.get('citizenIdVerified', false) != true &&
+                  resource.data.get('identityVerifiedFromDatabase', false) != true
+                ) ||
+                (
+                  request.resource.data.get('citizenIdVerified', false) == resource.data.get('citizenIdVerified', false) &&
+                  request.resource.data.get('identityVerifiedFromDatabase', false) == resource.data.get('identityVerifiedFromDatabase', false) &&
+                  request.resource.data.get('citizenId', '') == resource.data.get('citizenId', '') &&
+                  request.resource.data.get('displayName', '') == resource.data.get('displayName', '') &&
+                  request.resource.data.get('dob', '') == resource.data.get('dob', '') &&
+                  request.resource.data.get('gender', '') == resource.data.get('gender', '') &&
+                  request.resource.data.get('ethnicity', '') == resource.data.get('ethnicity', '') &&
+                  request.resource.data.get('provinceCode', '') == resource.data.get('provinceCode', '') &&
+                  request.resource.data.get('provinceName', '') == resource.data.get('provinceName', '') &&
+                  request.resource.data.get('wardCode', '') == resource.data.get('wardCode', '') &&
+                  request.resource.data.get('wardName', '') == resource.data.get('wardName', '') &&
+                  request.resource.data.get('address', '') == resource.data.get('address', '') &&
+                  request.resource.data.get('department', '') == resource.data.get('department', '') &&
+                  request.resource.data.get('position', '') == resource.data.get('position', '')
+                )
+              )
+            )
+          ))
+      );
+      allow delete: if isValidId(userId) && isAdmin();
+
+      // Strictly isolated 2FA TOTP secrets (owner-only read/write; admin can delete for emergency lockout recovery)
+      match /security/{docId} {
+        allow get: if isValidId(userId) && docId == 'totp' && isOwner(userId);
+        allow list: if false;
+        allow create, update: if isValidId(userId) && docId == 'totp' && isOwner(userId) && isNotBanned() && isValidUserTotp(request.resource.data);
+        allow delete: if isValidId(userId) && docId == 'totp' && ((isOwner(userId) && isNotBanned()) || isAdmin());
+      }
+
+      // Verified login devices managed by owner or restored by admin
+      match /devices/{deviceId} {
+        allow get: if isValidId(userId) && isValidId(deviceId) && (isOwner(userId) || isAdmin());
+        allow list: if isValidId(userId) && (isOwner(userId) || isAdmin());
+        allow create, update: if isValidId(userId) && isValidId(deviceId) && ((isOwner(userId) && isNotBanned()) || isAdmin()) && isValidUserDevice(request.resource.data, deviceId);
+        allow delete: if isValidId(userId) && isValidId(deviceId) && ((isOwner(userId) && isNotBanned()) || isAdmin());
+      }
+    }
+
+    // Posts (News, health communication)
+    match /posts/{postId} {
+      allow get: if isValidId(postId);
+      allow list: if true;
+      allow create, delete: if isValidId(postId) && isStaff();
+      allow update: if isValidId(postId) && (
+        isStaff() || (
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['views']) &&
+          request.resource.data.views is int &&
+          request.resource.data.views == resource.data.get('views', 0) + 1
+        )
+      );
+    }
+
+    // Announcements
+    match /announcements/{announcementId} {
+      allow get: if isValidId(announcementId);
+      allow list: if true;
+      allow create, delete: if isValidId(announcementId) && isStaff();
+      allow update: if isValidId(announcementId) && (
+        isStaff() || (
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readByDeviceIds', 'viewCount']) &&
+          request.resource.data.get('viewCount', 0) is int &&
+          request.resource.data.get('viewCount', 0) >= resource.data.get('viewCount', 0) &&
+          request.resource.data.get('viewCount', 0) <= resource.data.get('viewCount', 0) + 1
+        )
+      );
+    }
+
+    // Services Catalog
+    match /services/{serviceId} {
+      allow get: if isValidId(serviceId);
+      allow list: if true;
+      allow create, update, delete: if isValidId(serviceId) && isStaff();
+    }
+
+    // Appointments (Citizen bookings)
+    match /appointments/{appointmentId} {
+      allow get: if isValidId(appointmentId);
+      allow list: if isStaff() || (isSignedIn() && resource.data.userUid == request.auth.uid);
+      allow create: if isValidId(appointmentId) && isNotBanned() && (
+        isAdmin() || (
+          request.resource.data.fullName is string &&
+          request.resource.data.phone is string &&
+          request.resource.data.serviceName is string
+        )
+      );
+      allow update: if isValidId(appointmentId) && isNotBanned() && (
+        isStaff() ||
+        (isSignedIn() && resource.data.userUid == request.auth.uid)
+      );
+      allow delete: if isValidId(appointmentId) && isAdmin();
+    }
+
+    function isValidFeedbackAttachment(att) {
+      return att is map &&
+        att.keys().hasAll(['id', 'name', 'path', 'size', 'downloadUrl', 'kind', 'uploadedAt']) &&
+        att.keys().hasOnly(['id', 'name', 'path', 'sha', 'size', 'mimeType', 'kind', 'downloadUrl', 'htmlUrl', 'uploadedAt']) &&
+        att.id is string && att.id.size() >= 1 && att.id.size() <= 512 &&
+        att.name is string && att.name.size() >= 1 && att.name.size() <= 256 &&
+        att.path is string && att.path.size() >= 1 && att.path.size() <= 512 &&
+        att.size is int && att.size > 0 && att.size <= 20971520 &&
+        att.downloadUrl is string && att.downloadUrl.size() >= 8 && att.downloadUrl.size() <= 1024 &&
+        att.kind in ['image', 'video', 'audio', 'document', 'other'] &&
+        att.uploadedAt is string && att.uploadedAt.size() <= 64 &&
+        (!('sha' in att) || (att.sha is string && att.sha.size() <= 128)) &&
+        (!('mimeType' in att) || (att.mimeType is string && att.mimeType.size() <= 128)) &&
+        (!('htmlUrl' in att) || (att.htmlUrl is string && att.htmlUrl.size() <= 1024));
+    }
+
+    function isValidFeedbackAttachmentsList(list) {
+      return list is list &&
+        list.size() <= 5 &&
+        (list.size() < 1 || isValidFeedbackAttachment(list[0])) &&
+        (list.size() < 2 || isValidFeedbackAttachment(list[1])) &&
+        (list.size() < 3 || isValidFeedbackAttachment(list[2])) &&
+        (list.size() < 4 || isValidFeedbackAttachment(list[3])) &&
+        (list.size() < 5 || isValidFeedbackAttachment(list[4]));
+    }
+
+    function isValidFeedbackCreate(data) {
+      return data.keys().hasAll(['ticketCode', 'category', 'content', 'status']) &&
+        data.keys().hasOnly([
+          'ticketCode', 'fullName', 'email', 'phone', 'category', 'content',
+          'isAnonymous', 'status', 'response', 'assignedDepartment',
+          'attachments', 'githubBackupUrl',
+          'uid', 'deviceId', 'createdAt', 'updatedAt', 'withdrawnAt'
+        ]) &&
+        data.ticketCode is string && data.ticketCode.size() >= 3 && data.ticketCode.size() <= 64 &&
+        data.category is string && data.category.size() >= 1 && data.category.size() <= 64 &&
+        data.content is string && data.content.size() >= 1 && data.content.size() <= 4000 &&
+        data.status == 'new' &&
+        (!('fullName' in data) || (data.fullName is string && data.fullName.size() <= 128)) &&
+        (!('email' in data) || (data.email is string && data.email.size() <= 256)) &&
+        (!('phone' in data) || (data.phone is string && data.phone.size() <= 32)) &&
+        (!('isAnonymous' in data) || data.isAnonymous is bool) &&
+        (!('response' in data) || (data.response is string && data.response.size() <= 4000)) &&
+        (!('assignedDepartment' in data) || (data.assignedDepartment is string && data.assignedDepartment.size() <= 128)) &&
+        (!('attachments' in data) || isValidFeedbackAttachmentsList(data.attachments)) &&
+        (!('githubBackupUrl' in data) || (data.githubBackupUrl is string && data.githubBackupUrl.size() <= 1024)) &&
+        (!('uid' in data) || (data.uid is string && data.uid.size() <= 128)) &&
+        (!('deviceId' in data) || (data.deviceId is string && data.deviceId.size() <= 128)) &&
+        (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64)) &&
+        (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64)) &&
+        (!('withdrawnAt' in data) || (data.withdrawnAt is string && data.withdrawnAt.size() <= 64));
+    }
+
+    // Feedback & Petitions
+    match /feedback/{feedbackId} {
+      allow get: if isValidId(feedbackId) && (
+        isStaff() ||
+        (
+          isSignedIn() &&
+          ('uid' in resource.data) &&
+          resource.data.uid is string &&
+          resource.data.uid.size() > 0 &&
+          resource.data.uid == request.auth.uid
+        )
+      );
+      allow list: if isStaff() || (
+        isSignedIn() &&
+        ('uid' in resource.data) &&
+        resource.data.uid is string &&
+        resource.data.uid.size() > 0 &&
+        resource.data.uid == request.auth.uid
+      );
+      allow create: if isValidId(feedbackId) && isNotBanned() && (
+        isAdmin() || (
+          isValidFeedbackCreate(request.resource.data) &&
+          (!('uid' in request.resource.data) || request.resource.data.uid == '' || (isSignedIn() && request.resource.data.uid == request.auth.uid))
+        )
+      );
+      allow update: if isValidId(feedbackId) && isNotBanned() && (
+        isStaff() || (
+          isSignedIn() &&
+          ('uid' in resource.data) &&
+          resource.data.uid is string &&
+          resource.data.uid.size() > 0 &&
+          resource.data.uid == request.auth.uid &&
+          resource.data.status in ['new', 'processing', 'forwarded'] &&
+          request.resource.data.status == 'withdrawn' &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'withdrawnAt', 'updatedAt']) &&
+          request.resource.data.withdrawnAt is string &&
+          request.resource.data.withdrawnAt.size() <= 64 &&
+          request.resource.data.updatedAt is string &&
+          request.resource.data.updatedAt.size() <= 64
+        )
+      );
+      allow delete: if isValidId(feedbackId) && isAdmin();
+    }
+
+    // Tasks (Internal workspace)
+    match /tasks/{taskId} {
+      allow get: if isValidId(taskId) && isStaff();
+      allow list: if isStaff();
+      allow create, update, delete: if isValidId(taskId) && isStaff();
+    }
+
+    // Work Schedules & Duty Roster
+    match /workSchedules/{scheduleId} {
+      allow get: if isValidId(scheduleId);
+      allow list: if true;
+      allow create, update, delete: if isValidId(scheduleId) && isStaff();
+    }
+
+    // Documents
+    match /documents/{documentId} {
+      allow get: if isValidId(documentId) && (
+        isStaff() ||
+        !('visibility' in resource.data) ||
+        resource.data.visibility != 'private'
+      );
+      allow list: if true;
+      allow create, update, delete: if isValidId(documentId) && isStaff();
+    }
+
+    // Audit Logs
+    match /auditLogs/{logId} {
+      allow get: if isValidId(logId) && isAdmin();
+      allow list: if isAdmin();
+      allow create: if isValidId(logId) && isSignedIn() && isNotBanned();
+      allow update, delete: if false; // Immutable audit log
+    }
+
+    // Backups
+    match /backups/{backupId} {
+      allow get: if isValidId(backupId) && isAdmin();
+      allow list: if isAdmin();
+      allow create: if isValidId(backupId) && isAdmin();
+      allow update, delete: if isValidId(backupId) && isAdmin();
+    }
+
+    // Targeted Notifications
+    match /targetedNotifications/{notificationId} {
+      allow get: if isValidId(notificationId);
+      allow list: if true;
+      allow create, delete: if isValidId(notificationId) && isStaff();
+      allow update: if isValidId(notificationId) && (
+        isStaff() || (
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readByUids', 'readByDeviceIds', 'viewCount']) &&
+          request.resource.data.get('viewCount', 0) is int &&
+          request.resource.data.get('viewCount', 0) >= resource.data.get('viewCount', 0) &&
+          request.resource.data.get('viewCount', 0) <= resource.data.get('viewCount', 0) + 1
+        )
+      );
+    }
+
+    // System Settings & Info
+    match /systemSettings/{settingId} {
+      allow get: if isValidId(settingId);
+      allow list: if true;
+      allow create, update, delete: if isValidId(settingId) && isAdmin();
+    }
+
+    // Site Visitor Statistics (day / month / year / total)
+    match /siteStats/{statId} {
+      allow get: if isValidId(statId);
+      allow list: if true;
+      allow create, update: if statId == 'summary' &&
+        request.resource.data.keys().hasAll(['dayKey', 'dayCount', 'monthKey', 'monthCount', 'yearKey', 'yearCount', 'total']) &&
+        request.resource.data.dayKey is string && request.resource.data.dayKey.size() == 10 &&
+        request.resource.data.monthKey is string && request.resource.data.monthKey.size() == 7 &&
+        request.resource.data.yearKey is string && request.resource.data.yearKey.size() == 4 &&
+        request.resource.data.dayCount is int && request.resource.data.dayCount >= 0 &&
+        request.resource.data.monthCount is int && request.resource.data.monthCount >= 0 &&
+        request.resource.data.yearCount is int && request.resource.data.yearCount >= 0 &&
+        request.resource.data.total is int && request.resource.data.total >= 0;
+      allow delete: if isAdmin();
+    }
+
+    // Real-time Online Presence Sessions
+    match /onlinePresence/{sessionId} {
+      allow get, list: if true;
+      allow create, update: if isValidId(sessionId) &&
+        request.resource.data.sessionId == sessionId &&
+        request.resource.data.lastSeenMs is number;
+      allow delete: if isValidId(sessionId);
+    }
+
+    // Device Web Push Subscriptions
+    match /pushSubscriptions/{deviceId} {
+      allow get: if isValidId(deviceId);
+      allow list: if isStaff();
+      allow create, update: if isValidId(deviceId) &&
+        request.resource.data.deviceId == deviceId &&
+        request.resource.data.endpoint is string &&
+        request.resource.data.endpoint.size() > 10 &&
+        request.resource.data.endpoint.size() <= 2048;
+      allow delete: if isValidId(deviceId);
+    }
+
+    function isValidNearbyFacilityEditPayload(editData) {
+      return editData is map &&
+        editData.keys().hasAll([
+          'name', 'facilityType', 'level', 'address', 'ward', 'lat', 'lng',
+          'phone', 'emergencyPhone', 'workingHours', 'is24Hours', 'hasEmergency',
+          'hasBhyt', 'services', 'bedCount', 'headName', 'website', 'notes', 'requestedAt'
+        ]) &&
+        editData.keys().hasOnly([
+          'name', 'facilityType', 'level', 'address', 'ward', 'lat', 'lng',
+          'phone', 'emergencyPhone', 'workingHours', 'is24Hours', 'hasEmergency',
+          'hasBhyt', 'services', 'bedCount', 'headName', 'website', 'notes',
+          'submittedBy', 'requestedAt'
+        ]) &&
+        editData.name is string && editData.name.size() >= 1 && editData.name.size() <= 256 &&
+        editData.facilityType in ['hospital', 'clinic', 'health_station', 'emergency_center', 'pharmacy', 'other'] &&
+        editData.level is string && editData.level.size() >= 1 && editData.level.size() <= 128 &&
+        editData.address is string && editData.address.size() >= 1 && editData.address.size() <= 512 &&
+        editData.ward is string && editData.ward.size() >= 1 && editData.ward.size() <= 128 &&
+        editData.lat is number && editData.lat >= -90 && editData.lat <= 90 &&
+        editData.lng is number && editData.lng >= -180 && editData.lng <= 180 &&
+        editData.phone is string && editData.phone.size() >= 1 && editData.phone.size() <= 64 &&
+        editData.emergencyPhone is string && editData.emergencyPhone.size() >= 1 && editData.emergencyPhone.size() <= 64 &&
+        editData.workingHours is string && editData.workingHours.size() >= 1 && editData.workingHours.size() <= 256 &&
+        editData.is24Hours is bool &&
+        editData.hasEmergency is bool &&
+        editData.hasBhyt is bool &&
+        editData.services is string && editData.services.size() >= 1 && editData.services.size() <= 2000 &&
+        editData.bedCount is int && editData.bedCount >= 0 &&
+        editData.headName is string && editData.headName.size() >= 1 && editData.headName.size() <= 128 &&
+        editData.website is string && editData.website.size() >= 1 && editData.website.size() <= 512 &&
+        editData.notes is string && editData.notes.size() >= 1 && editData.notes.size() <= 2000 &&
+        editData.requestedAt is string && editData.requestedAt.size() >= 1 && editData.requestedAt.size() <= 64 &&
+        (!('submittedBy' in editData) || (editData.submittedBy is string && editData.submittedBy.size() <= 128));
+    }
+
+    function isValidNearbyFacility(data) {
+      return data.keys().hasAll(['name', 'facilityType', 'address', 'lat', 'lng', 'isActive', 'createdAt']) &&
+        data.keys().hasOnly([
+          'name', 'facilityType', 'level', 'address', 'ward', 'lat', 'lng',
+          'phone', 'emergencyPhone', 'workingHours', 'is24Hours', 'hasEmergency',
+          'hasBhyt', 'services', 'bedCount', 'headName', 'website', 'notes',
+          'approvalStatus', 'submittedBy', 'submittedByUid', 'submitterDeviceId', 'rejectionReason',
+          'editStatus', 'pendingEditData', 'editRequestedAt', 'editRejectionReason',
+          'isActive', 'order', 'createdAt', 'updatedAt'
+        ]) &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 256 &&
+        data.facilityType in ['hospital', 'clinic', 'health_station', 'emergency_center', 'pharmacy', 'other'] &&
+        data.address is string && data.address.size() >= 1 && data.address.size() <= 512 &&
+        data.lat is number && data.lat >= -90 && data.lat <= 90 &&
+        data.lng is number && data.lng >= -180 && data.lng <= 180 &&
+        data.isActive is bool &&
+        data.createdAt is string && data.createdAt.size() <= 64 &&
+        (!('level' in data) || (data.level is string && data.level.size() <= 128)) &&
+        (!('ward' in data) || (data.ward is string && data.ward.size() <= 128)) &&
+        (!('phone' in data) || (data.phone is string && data.phone.size() <= 64)) &&
+        (!('emergencyPhone' in data) || (data.emergencyPhone is string && data.emergencyPhone.size() <= 64)) &&
+        (!('workingHours' in data) || (data.workingHours is string && data.workingHours.size() <= 256)) &&
+        (!('is24Hours' in data) || data.is24Hours is bool) &&
+        (!('hasEmergency' in data) || data.hasEmergency is bool) &&
+        (!('hasBhyt' in data) || data.hasBhyt is bool) &&
+        (!('services' in data) || (data.services is string && data.services.size() <= 2000)) &&
+        (!('bedCount' in data) || data.bedCount is number) &&
+        (!('headName' in data) || (data.headName is string && data.headName.size() <= 128)) &&
+        (!('website' in data) || (data.website is string && data.website.size() <= 512)) &&
+        (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000)) &&
+        (!('approvalStatus' in data) || data.approvalStatus in ['approved', 'pending', 'rejected']) &&
+        !(data.isActive == true && ('approvalStatus' in data) && data.approvalStatus != 'approved') &&
+        (!('submittedBy' in data) || (data.submittedBy is string && data.submittedBy.size() <= 128)) &&
+        (!('submittedByUid' in data) || (data.submittedByUid is string && data.submittedByUid.size() <= 128)) &&
+        (!('submitterDeviceId' in data) || (data.submitterDeviceId is string && data.submitterDeviceId.size() <= 128)) &&
+        (!('rejectionReason' in data) || (data.rejectionReason is string && data.rejectionReason.size() <= 512)) &&
+        (!('editStatus' in data) || data.editStatus in ['none', 'pending_edit', 'rejected_edit']) &&
+        (!('pendingEditData' in data) || isValidNearbyFacilityEditPayload(data.pendingEditData)) &&
+        (!('editRequestedAt' in data) || (data.editRequestedAt is string && data.editRequestedAt.size() <= 64)) &&
+        (!('editRejectionReason' in data) || (data.editRejectionReason is string && data.editRejectionReason.size() <= 512)) &&
+        (!('order' in data) || data.order is number) &&
+        (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
+    }
+
+    function isValidPendingNearbyFacility(data) {
+      return isValidNearbyFacility(data) &&
+        data.keys().hasAll([
+          'name', 'facilityType', 'level', 'address', 'ward', 'lat', 'lng',
+          'phone', 'emergencyPhone', 'workingHours', 'is24Hours', 'hasEmergency',
+          'hasBhyt', 'services', 'bedCount', 'headName', 'website', 'notes',
+          'approvalStatus', 'isActive', 'createdAt', 'updatedAt'
+        ]) &&
+        data.isActive == false &&
+        data.approvalStatus == 'pending' &&
+        data.level.size() >= 1 &&
+        data.ward.size() >= 1 &&
+        data.phone.size() >= 1 &&
+        data.emergencyPhone.size() >= 1 &&
+        data.workingHours.size() >= 1 &&
+        data.services.size() >= 1 &&
+        data.bedCount is int && data.bedCount >= 0 &&
+        data.headName.size() >= 1 &&
+        data.website.size() >= 1 &&
+        data.notes.size() >= 1;
+    }
+
+    function isOwnPendingOrRejectedFacilityUpdate() {
+      return isValidPendingNearbyFacility(request.resource.data) &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        resource.data.approvalStatus in ['pending', 'rejected'] &&
+        (
+          (
+            isSignedIn() &&
+            ('submittedByUid' in resource.data) &&
+            resource.data.submittedByUid is string &&
+            resource.data.submittedByUid.size() > 0 &&
+            resource.data.submittedByUid == request.auth.uid &&
+            (!('submittedByUid' in request.resource.data) || request.resource.data.submittedByUid == request.auth.uid)
+          ) || (
+            (!('submittedByUid' in resource.data) || resource.data.submittedByUid == '') &&
+            ('submitterDeviceId' in resource.data) &&
+            resource.data.submitterDeviceId is string &&
+            resource.data.submitterDeviceId.size() >= 6 &&
+            ('submitterDeviceId' in request.resource.data) &&
+            request.resource.data.submitterDeviceId == resource.data.submitterDeviceId
+          )
+        );
+    }
+
+    function isApprovedFacilityEditProposal() {
+      return isValidNearbyFacility(request.resource.data) &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        resource.data.isActive == true &&
+        (!('approvalStatus' in resource.data) || resource.data.approvalStatus == 'approved') &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'editStatus', 'pendingEditData', 'editRequestedAt', 'editRejectionReason', 'updatedAt'
+        ]) &&
+        request.resource.data.editStatus == 'pending_edit' &&
+        ('pendingEditData' in request.resource.data) &&
+        isValidNearbyFacilityEditPayload(request.resource.data.pendingEditData) &&
+        ('editRequestedAt' in request.resource.data) &&
+        request.resource.data.editRequestedAt is string &&
+        request.resource.data.editRequestedAt.size() >= 1 &&
+        request.resource.data.editRequestedAt.size() <= 64;
+    }
+
+    // Nearby Healthcare Facilities Directory
+    match /nearbyFacilities/{facilityId} {
+      allow get: if isValidId(facilityId) && (
+        isStaff() ||
+        resource.data.isActive == true ||
+        (
+          isSignedIn() &&
+          ('submittedByUid' in resource.data) &&
+          resource.data.submittedByUid is string &&
+          resource.data.submittedByUid.size() > 0 &&
+          resource.data.submittedByUid == request.auth.uid
+        )
+      );
+      allow list: if isStaff() ||
+        resource.data.isActive == true ||
+        (
+          isSignedIn() &&
+          ('submittedByUid' in resource.data) &&
+          resource.data.submittedByUid is string &&
+          resource.data.submittedByUid.size() > 0 &&
+          resource.data.submittedByUid == request.auth.uid
+        );
+      allow create: if isValidId(facilityId) && isNotBanned() && (
+        (isAdmin() && isValidNearbyFacility(request.resource.data)) ||
+        (
+          isValidPendingNearbyFacility(request.resource.data) &&
+          (!('submittedByUid' in request.resource.data) || request.resource.data.submittedByUid == '' || (isSignedIn() && request.resource.data.submittedByUid == request.auth.uid))
+        )
+      );
+      allow update: if isValidId(facilityId) && isNotBanned() && (
+        (isAdmin() && isValidNearbyFacility(request.resource.data) && request.resource.data.createdAt == resource.data.createdAt) ||
+        isOwnPendingOrRejectedFacilityUpdate() ||
+        isApprovedFacilityEditProposal()
+      );
+      allow delete: if isValidId(facilityId) && isAdmin();
+    }
+
+    function isValidRescueSignal(data) {
+      return data.keys().hasAll(['phone', 'category', 'lat', 'lng', 'status', 'deviceId', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'phone', 'extraPhone', 'senderName', 'senderAvatarUrl',
+          'senderCitizenIdMasked', 'senderDob', 'senderGender', 'senderAddress', 'senderVerified',
+          'category', 'note', 'lat', 'lng', 'accuracy',
+          'status', 'deviceId', 'uid', 'responderName', 'responderPhone', 'responderNote',
+          'outcome', 'referredToFacility', 'resolvedAt',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.phone is string && data.phone.size() >= 8 && data.phone.size() <= 32 &&
+        (!('extraPhone' in data) || (data.extraPhone is string && data.extraPhone.size() <= 32)) &&
+        data.category in ['medical_emergency', 'traffic_accident', 'disaster_flood', 'fire_rescue', 'other'] &&
+        data.lat is number && data.lat >= -90 && data.lat <= 90 &&
+        data.lng is number && data.lng >= -180 && data.lng <= 180 &&
+        data.status in ['active', 'responding', 'resolved', 'cancelled'] &&
+        data.deviceId is string && data.deviceId.size() >= 4 && data.deviceId.size() <= 128 &&
+        data.createdAt is string && data.createdAt.size() <= 64 &&
+        data.updatedAt is string && data.updatedAt.size() <= 64 &&
+        (!('senderName' in data) || (data.senderName is string && data.senderName.size() <= 128)) &&
+        (!('senderAvatarUrl' in data) || (data.senderAvatarUrl is string && data.senderAvatarUrl.size() <= 500000)) &&
+        (!('senderCitizenIdMasked' in data) || (data.senderCitizenIdMasked is string && data.senderCitizenIdMasked.size() <= 32)) &&
+        (!('senderDob' in data) || (data.senderDob is string && data.senderDob.size() <= 32)) &&
+        (!('senderGender' in data) || data.senderGender in ['Nam', 'Nữ', 'Khác']) &&
+        (!('senderAddress' in data) || (data.senderAddress is string && data.senderAddress.size() <= 512)) &&
+        (!('senderVerified' in data) || data.senderVerified is bool) &&
+        (!('note' in data) || (data.note is string && data.note.size() <= 1000)) &&
+        (!('accuracy' in data) || data.accuracy is number) &&
+        (!('uid' in data) || (data.uid is string && data.uid.size() <= 128)) &&
+        (!('responderName' in data) || (data.responderName is string && data.responderName.size() <= 128)) &&
+        (!('responderPhone' in data) || (data.responderPhone is string && data.responderPhone.size() <= 32)) &&
+        (!('responderNote' in data) || (data.responderNote is string && data.responderNote.size() <= 1000)) &&
+        (!('outcome' in data) || data.outcome in ['on_site', 'referred']) &&
+        (!('referredToFacility' in data) || (data.referredToFacility is string && data.referredToFacility.size() <= 256)) &&
+        (!('resolvedAt' in data) || (data.resolvedAt is string && data.resolvedAt.size() <= 64));
+    }
+
+    // Real-time SOS Rescue Signals (Public emergency coordination)
+    match /rescueSignals/{signalId} {
+      allow get: if isValidId(signalId);
+      allow list: if true;
+      allow create: if isValidId(signalId) && isNotBanned() &&
+        isValidRescueSignal(request.resource.data) &&
+        request.resource.data.status == 'active';
+      allow update: if isValidId(signalId) && isNotBanned() &&
+        isValidRescueSignal(request.resource.data) && (
+          isAdmin() || (
+            request.resource.data.createdAt == resource.data.createdAt &&
+            request.resource.data.phone == resource.data.phone &&
+            request.resource.data.deviceId == resource.data.deviceId && (
+              isStaff() || (
+                resource.data.status in ['active', 'responding'] &&
+                request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lat', 'lng', 'accuracy', 'status', 'note', 'outcome', 'resolvedAt', 'updatedAt'])
+              )
+            )
+          )
+        );
+      allow delete: if isValidId(signalId) && isAdmin();
+    }
+
+    function isValidStationEvent(data) {
+      return data.keys().hasAll(['title', 'eventDate', 'category', 'description', 'enableConfetti', 'enableAutoPopup', 'isActive', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'title', 'eventDate', 'endDate', 'startTime', 'endTime', 'location',
+          'category', 'description', 'greetingMessage', 'enableConfetti', 'enableAutoPopup',
+          'isAnnual', 'isActive', 'createdBy', 'createdAt', 'updatedAt'
+        ]) &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 256 &&
+        data.eventDate is string && data.eventDate.size() >= 8 && data.eventDate.size() <= 32 &&
+        data.category in ['health_day', 'celebration', 'community', 'campaign', 'holiday', 'other'] &&
+        data.description is string && data.description.size() >= 1 && data.description.size() <= 4000 &&
+        data.enableConfetti is bool &&
+        data.enableAutoPopup is bool &&
+        data.isActive is bool &&
+        data.createdAt is string && data.createdAt.size() <= 64 &&
+        data.updatedAt is string && data.updatedAt.size() <= 64 &&
+        (!('endDate' in data) || (data.endDate is string && data.endDate.size() <= 32)) &&
+        (!('startTime' in data) || (data.startTime is string && data.startTime.size() <= 16)) &&
+        (!('endTime' in data) || (data.endTime is string && data.endTime.size() <= 16)) &&
+        (!('location' in data) || (data.location is string && data.location.size() <= 256)) &&
+        (!('greetingMessage' in data) || (data.greetingMessage is string && data.greetingMessage.size() <= 2000)) &&
+        (!('isAnnual' in data) || data.isAnnual is bool) &&
+        (!('createdBy' in data) || (data.createdBy is string && data.createdBy.size() <= 128));
+    }
+
+    // Station Events & Holiday Celebrations
+    match /events/{eventId} {
+      allow get: if isValidId(eventId) && (isStaff() || resource.data.isActive == true);
+      allow list: if true;
+      allow create: if isValidId(eventId) && isAdmin() && isValidStationEvent(request.resource.data);
+      allow update: if isValidId(eventId) && isAdmin() && isValidStationEvent(request.resource.data) &&
+        request.resource.data.createdAt == resource.data.createdAt;
+      allow delete: if isValidId(eventId) && isAdmin();
+    }
+  }
+}

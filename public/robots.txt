@@ -1,0 +1,18 @@
+User-agent: *
+Allow: /
+Allow: /seoapp.jpg
+Allow: /seoapp.png
+Allow: /iconapp.png
+Disallow: /api/
+
+User-agent: facebookexternalhit
+Allow: /
+
+User-agent: Twitterbot
+Allow: /
+
+User-agent: Zalo
+Allow: /
+
+User-agent: TelegramBot
+Allow: /
