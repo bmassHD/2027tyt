@@ -78,6 +78,24 @@ export default defineConfig(() => {
           enabled: true,
           type: 'module',
         },
+        integration: {
+          configureCustomSWViteBuild(inlineConfig) {
+            const buildCfg = inlineConfig.build as Record<string, any> | undefined;
+            const rollupOpts = buildCfg?.rollupOptions as Record<string, any> | undefined;
+            if (rollupOpts) {
+              const out = rollupOpts.output;
+              if (out && !Array.isArray(out)) {
+                delete out.inlineDynamicImports;
+                out.codeSplitting = false;
+              }
+              buildCfg!.rolldownOptions = {
+                ...rollupOpts,
+                ...(buildCfg?.rolldownOptions || {}),
+              };
+              delete buildCfg!.rollupOptions;
+            }
+          },
+        },
       }),
     ],
     resolve: {
